@@ -29,6 +29,11 @@
 #define PMS_RX_PIN 16
 #define PMS_TX_PIN 17
 
+// ---------------- Testing ----------------
+// TODO: set back to false once you're done testing — this bypasses the
+// change-threshold/alert/queue-full gate and uploads every single reading.
+#define UPLOAD_EVERY_READING true
+
 // ---------------- Timing ----------------
 #define SENSOR_WARMUP_MS 30000          // PMS5003 needs about 30 s after wake for stable data
 #define SLEEP_INTERVAL_SEC 60
@@ -266,7 +271,8 @@ void setup() {
 
   pushToRTCQueue(current);
 
-  bool shouldUpload = hasChangedSignificantly(current) ||
+  bool shouldUpload = UPLOAD_EVERY_READING ||
+                      hasChangedSignificantly(current) ||
                       alertActive ||
                       (rtcQueueCount >= MAX_QUEUE_SIZE);
 
