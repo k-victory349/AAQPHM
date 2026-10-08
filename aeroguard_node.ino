@@ -79,7 +79,9 @@ const char gsmServerPath[] = "/api/v1/devices/readings";
 // ---------------- BLE ----------------
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define NETWORKS_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9"
 #define BLE_PASSKEY 102026              // 6-digit PIN the phone must enter to pair
+#define MAX_SCAN_NETWORKS 6              // shortlist size sent to the phone, strongest first
 
 // ---------------- Data types and RTC state ----------------
 struct SensorReading {
@@ -118,7 +120,8 @@ int buildBatchJsonPayload(char* buffer, size_t maxLen, uint32_t nowSec);
 void parseAndUpdateThresholds(const String& payload);
 bool uploadReadingToVercel(const char* jsonPayload);
 bool transmitViaBLE(const char* jsonPayload);
-bool sendPayloadOverBLE(const char* jsonPayload);
+bool sendOverBLE(NimBLECharacteristic* chr, const char* payload);
+String scanNetworksJson();
 bool transmitViaGSM(const char* jsonPayload);
 void shutdownGSM();
 void powerDownAndSleep();
@@ -140,9 +143,11 @@ HardwareSerial pmsSerial(2);
 
 NimBLEServer* pServer = nullptr;
 NimBLECharacteristic* pCharacteristic = nullptr;
+NimBLECharacteristic* pNetworksCharacteristic = nullptr;
 volatile bool deviceConnected = false;
 volatile bool deviceAuthenticated = false;
 volatile bool clientSubscribed = false;
+volatile bool networksClientSubscribed = false;
 volatile bool bleAckReceived = false;
 volatile bool wifiCredsUpdated = false;
 volatile uint16_t peerMTU = 23;
@@ -161,6 +166,7 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
     deviceConnected = false;
     deviceAuthenticated = false;
     clientSubscribed = false;
+    networksClientSubscribed = false;
     Serial.println("Phone disconnected.");
   }
   uint32_t onPassKeyDisplay() override {
@@ -225,6 +231,13 @@ class CharacteristicCallbacks : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* chr, NimBLEConnInfo& connInfo, uint16_t subValue) override {
     clientSubscribed = (subValue & 0x0001);   // bit 0 = notifications enabled
     Serial.printf("BLE: notifications %s\n", clientSubscribed ? "enabled" : "disabled");
+  }
+};
+
+class NetworksCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* chr, NimBLEConnInfo& connInfo, uint16_t subValue) override {
+    networksClientSubscribed = (subValue & 0x0001);
+    Serial.printf("BLE: network-list notifications %s\n", networksClientSubscribed ? "enabled" : "disabled");
   }
 };
 
@@ -411,16 +424,25 @@ bool uploadReadingToVercel(const char* jsonPayload) {
 // App protocol:
 //   1. Connect. The phone shows a pairing prompt; enter the PIN (BLE_PASSKEY).
 //      After the first successful pairing the phone stays bonded and is not asked again.
-//   2. Request a larger MTU (Android: requestMtu(247)), enable notifications.
-//   3. Collect notification chunks until one equals "END". Concatenate = JSON array.
-//   4. Write "ACK" to the characteristic as soon as the JSON is stored on the phone.
-//   Optional writes: "SSID:PASSWORD" for Wi-Fi, or threshold JSON from the server.
+//   2. Request a larger MTU (Android: requestMtu(247)).
+//   3. Subscribe to NETWORKS_CHARACTERISTIC_UUID to receive nearby Wi-Fi networks:
+//      collect notification chunks until one equals "END", concatenate = JSON array of
+//      {"s": ssid, "r": rssi dBm, "o": isOpen}, strongest signal first, sent once per
+//      connection as soon as this characteristic is subscribed to.
+//   4. Subscribe to CHARACTERISTIC_UUID the same way to receive sensor readings
+//      (chunks until "END" = JSON array).
+//   5. Write "ACK" to CHARACTERISTIC_UUID as soon as the sensor-reading JSON is stored.
+//   Optional writes to CHARACTERISTIC_UUID: "SSID:PASSWORD" to set/change Wi-Fi — pick
+//      one ssid from the networks list and prompt the user for its password — or
+//      threshold JSON from the server.
 bool transmitViaBLE(const char* jsonPayload) {
   deviceConnected = false;
   deviceAuthenticated = false;
   clientSubscribed = false;
+  networksClientSubscribed = false;
   bleAckReceived = false;
   peerMTU = 23;
+  bool networksSent = false;
 
   NimBLEDevice::init("AeroGuard_Node");
   NimBLEDevice::setMTU(247);
@@ -441,6 +463,13 @@ bool transmitViaBLE(const char* jsonPayload) {
       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN |
       NIMBLE_PROPERTY::NOTIFY);
   pCharacteristic->setCallbacks(new CharacteristicCallbacks());
+
+  pNetworksCharacteristic = pService->createCharacteristic(
+      NETWORKS_CHARACTERISTIC_UUID,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN |
+      NIMBLE_PROPERTY::NOTIFY);
+  pNetworksCharacteristic->setCallbacks(new NetworksCharacteristicCallbacks());
+
   pService->start();
 
   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
@@ -453,9 +482,16 @@ bool transmitViaBLE(const char* jsonPayload) {
   unsigned long start = millis();
 
   while (millis() - start < BLE_WINDOW_MS) {
+    if (!networksSent && deviceConnected && deviceAuthenticated && networksClientSubscribed) {
+      String netJson = scanNetworksJson();
+      Serial.printf("Sending nearby Wi-Fi networks over BLE: %s\n", netJson.c_str());
+      sendOverBLE(pNetworksCharacteristic, netJson.c_str());
+      networksSent = true;
+    }
+
     if (deviceConnected && deviceAuthenticated && clientSubscribed) {
       delay(300);   // give the app time to finish MTU negotiation
-      if (sendPayloadOverBLE(jsonPayload)) {
+      if (sendOverBLE(pCharacteristic, jsonPayload)) {
         unsigned long ackStart = millis();
         while (!bleAckReceived && deviceConnected && millis() - ackStart < BLE_ACK_TIMEOUT_MS) {
           delay(50);
@@ -478,28 +514,84 @@ bool transmitViaBLE(const char* jsonPayload) {
   return delivered;
 }
 
-bool sendPayloadOverBLE(const char* jsonPayload) {
+bool sendOverBLE(NimBLECharacteristic* chr, const char* payload) {
   size_t mtu = peerMTU < 23 ? 23 : peerMTU;
   size_t chunkSize = mtu - 3;           // ATT header takes 3 bytes
   if (chunkSize > 244) chunkSize = 244;
 
-  size_t totalLen = strlen(jsonPayload);
+  size_t totalLen = strlen(payload);
   Serial.printf("Sending %u bytes over BLE in %u-byte chunks\n",
                 (unsigned)totalLen, (unsigned)chunkSize);
 
   for (size_t offset = 0; offset < totalLen; offset += chunkSize) {
     if (!deviceConnected) return false;
     size_t len = std::min(chunkSize, totalLen - offset);
-    pCharacteristic->setValue((const uint8_t*)(jsonPayload + offset), len);
-    if (!pCharacteristic->notify()) {
+    chr->setValue((const uint8_t*)(payload + offset), len);
+    if (!chr->notify()) {
       delay(50);
-      if (!pCharacteristic->notify()) return false;
+      if (!chr->notify()) return false;
     }
     delay(20);
   }
 
-  pCharacteristic->setValue((const uint8_t*)"END", 3);
-  return pCharacteristic->notify();
+  chr->setValue((const uint8_t*)"END", 3);
+  return chr->notify();
+}
+
+// Scans for nearby Wi-Fi networks and returns a JSON array of the strongest
+// MAX_SCAN_NETWORKS, deduped by SSID, e.g. [{"s":"Home_5G","r":-45,"o":false}].
+String scanNetworksJson() {
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks();
+  Serial.printf("Wi-Fi scan found %d network(s).\n", n);
+
+  int bestIdx[MAX_SCAN_NETWORKS];
+  int bestCount = 0;
+
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i).length() == 0) continue;   // skip hidden networks
+
+    bool dup = false;
+    for (int j = 0; j < bestCount; j++) {
+      if (WiFi.SSID(bestIdx[j]) == WiFi.SSID(i)) { dup = true; break; }
+    }
+    if (dup) continue;
+
+    if (bestCount < MAX_SCAN_NETWORKS) {
+      bestIdx[bestCount++] = i;
+    } else {
+      int weakest = 0;
+      for (int j = 1; j < bestCount; j++) {
+        if (WiFi.RSSI(bestIdx[j]) < WiFi.RSSI(bestIdx[weakest])) weakest = j;
+      }
+      if (WiFi.RSSI(i) > WiFi.RSSI(bestIdx[weakest])) bestIdx[weakest] = i;
+    }
+  }
+
+  // Strongest signal first.
+  for (int a = 0; a < bestCount - 1; a++) {
+    for (int b = a + 1; b < bestCount; b++) {
+      if (WiFi.RSSI(bestIdx[b]) > WiFi.RSSI(bestIdx[a])) {
+        int t = bestIdx[a]; bestIdx[a] = bestIdx[b]; bestIdx[b] = t;
+      }
+    }
+  }
+
+  String json = "[";
+  for (int j = 0; j < bestCount; j++) {
+    int i = bestIdx[j];
+    String ssid = WiFi.SSID(i);
+    ssid.replace("\"", "");
+    ssid.replace("\\", "");
+    if (ssid.length() > 24) ssid = ssid.substring(0, 24);
+    bool open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+    if (j > 0) json += ",";
+    json += "{\"s\":\"" + ssid + "\",\"r\":" + String(WiFi.RSSI(i)) + ",\"o\":" + (open ? "true" : "false") + "}";
+  }
+  json += "]";
+
+  WiFi.scanDelete();
+  return json;
 }
 
 // ---------------- GSM ----------------
